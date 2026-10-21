@@ -131,6 +131,7 @@ jobs:
             --binaries "codex codex-code-mode-host"
 
       - name: Build Codex package archive
+        id: package_archive
         shell: bash
         env:
           TARGET: aarch64-unknown-linux-musl
@@ -175,15 +176,18 @@ jobs:
           manifest = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
           assert manifest["version"] == "0.163.0", manifest
           assert manifest["target"] == "aarch64-unknown-linux-musl", manifest
-          assert manifest["variant"] == "primary", manifest
+          assert manifest["variant"] == "codex", manifest
           assert manifest["entrypoint"] == "bin/codex", manifest
           print(json.dumps(manifest, indent=2))
           PY
 
-          "$package_dir/bin/codex" --version
-          "$package_dir/bin/codex" app-server daemon version
+          verify_home="${RUNNER_TEMP}/verify-codex-home-${TARGET}"
+          mkdir -p "$verify_home"
+          CODEX_HOME="$verify_home" "$package_dir/bin/codex" --version
+          CODEX_HOME="$verify_home" "$package_dir/bin/codex" app-server daemon version
 
       - name: Write checksums and build manifest
+        if: ${{ !cancelled() && steps.package_archive.outcome == 'success' }}
         shell: bash
         env:
           TARGET: aarch64-unknown-linux-musl
@@ -251,6 +255,7 @@ jobs:
           cat "${dist_dir}/build-manifest.json"
 
       - name: Upload ARM64 package
+        if: ${{ !cancelled() && steps.package_archive.outcome == 'success' }}
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: codex-package-aarch64-unknown-linux-musl
