@@ -1,0 +1,262 @@
+name: hosted-search-package
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - fix/hosted-search-context-usage-v0163
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CODEX_REPO_ROOT: ${{ github.workspace }}
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  CARGO_INCREMENTAL: "0"
+  AWS_LC_SYS_NO_JITTER_ENTROPY: "1"
+  AWS_LC_SYS_NO_JITTER_ENTROPY_AARCH64_UNKNOWN_LINUX_MUSL: "1"
+
+jobs:
+  package-arm64-musl:
+    name: Build aarch64-unknown-linux-musl primary package
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    defaults:
+      run:
+        working-directory: codex-rs
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Record runner and source
+        shell: bash
+        run: |
+          set -euo pipefail
+          uname -a
+          nproc
+          free -h
+          df -h .
+          git rev-parse HEAD
+          git log -1 --oneline
+
+      - name: Install Linux package dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            --no-install-recommends \
+            binutils \
+            file \
+            libcap-dev \
+            pkg-config
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          targets: aarch64-unknown-linux-musl
+
+      - name: Use hermetic Cargo home
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo_home="${GITHUB_WORKSPACE}/.cargo-home"
+          mkdir -p "${cargo_home}/bin"
+          echo "CARGO_HOME=${cargo_home}" >> "$GITHUB_ENV"
+          echo "${cargo_home}/bin" >> "$GITHUB_PATH"
+          : > "${cargo_home}/config.toml"
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.14.0
+          use-cache: false
+
+      - name: Install musl build tools
+        shell: bash
+        env:
+          TARGET: aarch64-unknown-linux-musl
+        run: bash "${GITHUB_WORKSPACE}/.github/scripts/install-musl-build-tools.sh"
+
+      - name: Configure rusty_v8 artifacts
+        uses: ./.github/actions/setup-rusty-v8
+        with:
+          target: aarch64-unknown-linux-musl
+
+      - name: Build and finalize bwrap
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="aarch64-unknown-linux-musl"
+          cargo build --target "$target" --release --timings --bin bwrap
+
+          bwrap_path="target/${target}/release/bwrap"
+          test -f "$bwrap_path"
+          strip --strip-debug --strip-unneeded "$bwrap_path"
+          digest="$(sha256sum "$bwrap_path" | awk '{print $1}')"
+          echo "CODEX_BWRAP_SHA256=${digest}" >> "$GITHUB_ENV"
+          printf 'bwrap %s\n' "$digest"
+
+      - name: Build Codex and code mode host
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="aarch64-unknown-linux-musl"
+          export STABLE_GIT_COMMIT="$(git rev-parse HEAD)"
+          cargo build \
+            --target "$target" \
+            --release \
+            --timings \
+            --bin codex \
+            --bin codex-code-mode-host
+
+      - name: Archive symbols and strip release binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="aarch64-unknown-linux-musl"
+          bash "${GITHUB_WORKSPACE}/.github/scripts/archive-release-symbols-and-strip-binaries.sh" \
+            --target "$target" \
+            --artifact-name "$target" \
+            --release-dir "target/${target}/release" \
+            --archive-dir "symbols-dist/${target}" \
+            --binaries "codex codex-code-mode-host"
+
+      - name: Build Codex package archive
+        shell: bash
+        env:
+          TARGET: aarch64-unknown-linux-musl
+        run: |
+          set -euo pipefail
+          bash "${GITHUB_WORKSPACE}/.github/scripts/build-codex-package-archive.sh" \
+            --target "$TARGET" \
+            --bundle primary \
+            --entrypoint-dir "target/${TARGET}/release" \
+            --archive-dir "dist/${TARGET}"
+
+      - name: Verify package locally
+        shell: bash
+        env:
+          TARGET: aarch64-unknown-linux-musl
+        run: |
+          set -euo pipefail
+          archive="dist/${TARGET}/codex-package-${TARGET}.tar.gz"
+          package_dir="${RUNNER_TEMP}/verify-codex-package-${TARGET}"
+          mkdir -p "$package_dir"
+          tar -xzf "$archive" -C "$package_dir"
+
+          test -x "$package_dir/bin/codex"
+          test -x "$package_dir/bin/codex-code-mode-host"
+          test -x "$package_dir/codex-resources/bwrap"
+          test -x "$package_dir/codex-path/rg"
+          file "$package_dir/bin/codex"
+          file "$package_dir/bin/codex-code-mode-host"
+          file "$package_dir/codex-resources/bwrap"
+
+          file "$package_dir/bin/codex" | grep -q 'ARM aarch64'
+          if readelf -d "$package_dir/bin/codex" 2>/dev/null | grep -q '(NEEDED)'; then
+            echo "codex unexpectedly has dynamic library dependencies" >&2
+            exit 1
+          fi
+
+          python3 - "$package_dir/codex-package.json" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          manifest = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          assert manifest["version"] == "0.163.0", manifest
+          assert manifest["target"] == "aarch64-unknown-linux-musl", manifest
+          assert manifest["variant"] == "primary", manifest
+          assert manifest["entrypoint"] == "bin/codex", manifest
+          print(json.dumps(manifest, indent=2))
+          PY
+
+          "$package_dir/bin/codex" --version
+          "$package_dir/bin/codex" app-server daemon version
+
+      - name: Write checksums and build manifest
+        shell: bash
+        env:
+          TARGET: aarch64-unknown-linux-musl
+        run: |
+          set -euo pipefail
+          dist_dir="dist/${TARGET}"
+          archive_name="codex-package-${TARGET}.tar.gz"
+          archive="${dist_dir}/${archive_name}"
+          core_fix_commit="$(
+            git -C "${GITHUB_WORKSPACE}" log -1 --format=%H -- \
+              codex-rs/core/src/session/turn.rs \
+              codex-rs/core/src/session/mod.rs \
+              codex-rs/core/tests/suite/compact.rs
+          )"
+
+          (
+            cd "$dist_dir"
+            sha256sum "$archive_name" > "${archive_name}.sha256"
+          )
+
+          python3 - \
+            "${dist_dir}/build-manifest.json" \
+            "$archive" \
+            "$core_fix_commit" <<'PY'
+          import datetime
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import platform
+          import subprocess
+          import sys
+
+          output = pathlib.Path(sys.argv[1])
+          archive = pathlib.Path(sys.argv[2])
+          core_fix_commit = sys.argv[3]
+          digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+
+          def command(*args: str) -> str:
+              return subprocess.check_output(args, text=True).strip()
+
+          manifest = {
+              "repository": os.environ["GITHUB_REPOSITORY"],
+              "workflowRef": os.environ["GITHUB_REF"],
+              "workflowSha": os.environ["GITHUB_SHA"],
+              "buildCommit": command("git", "rev-parse", "HEAD"),
+              "coreFixCommit": core_fix_commit,
+              "version": "0.163.0",
+              "target": "aarch64-unknown-linux-musl",
+              "variant": "primary",
+              "rustc": command("rustc", "--version"),
+              "cargo": command("cargo", "--version"),
+              "python": platform.python_version(),
+              "runner": os.environ.get("RUNNER_NAME"),
+              "bwrapSha256": os.environ["CODEX_BWRAP_SHA256"],
+              "archive": archive.name,
+              "archiveSha256": digest,
+              "builtAt": datetime.datetime.now(datetime.UTC).isoformat(),
+          }
+          output.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+          print(json.dumps(manifest, indent=2))
+          PY
+
+          cat "${dist_dir}/${archive_name}.sha256"
+          cat "${dist_dir}/build-manifest.json"
+
+      - name: Upload ARM64 package
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: codex-package-aarch64-unknown-linux-musl
+          path: |
+            codex-rs/dist/aarch64-unknown-linux-musl/codex-package-aarch64-unknown-linux-musl.tar.gz
+            codex-rs/dist/aarch64-unknown-linux-musl/codex-package-aarch64-unknown-linux-musl.tar.gz.sha256
+            codex-rs/dist/aarch64-unknown-linux-musl/build-manifest.json
+          if-no-files-found: error
+          retention-days: 14
