@@ -184,7 +184,10 @@ jobs:
           verify_home="${RUNNER_TEMP}/verify-codex-home-${TARGET}"
           mkdir -p "$verify_home"
           CODEX_HOME="$verify_home" "$package_dir/bin/codex" --version
-          CODEX_HOME="$verify_home" "$package_dir/bin/codex" app-server daemon version
+          CODEX_HOME="$verify_home" "$package_dir/bin/codex" app-server daemon --help >/dev/null
+          timeout 20s env CODEX_HOME="$verify_home" \
+            "$package_dir/bin/codex" app-server --strict-config --stdio \
+            </dev/null >/dev/null
 
       - name: Write checksums and build manifest
         if: ${{ !cancelled() && steps.package_archive.outcome == 'success' }}
