@@ -5104,6 +5104,11 @@ impl Session {
     }
 
     pub(crate) async fn recompute_token_usage(&self, turn_context: &TurnContext) {
+        self.recompute_token_usage_without_event(turn_context).await;
+        self.send_token_count_event(turn_context).await;
+    }
+
+    pub(crate) async fn recompute_token_usage_without_event(&self, turn_context: &TurnContext) {
         let history = self.clone_history().await;
         let base_instructions = self.get_base_instructions().await;
         let Some(estimated_total_tokens) =
@@ -5140,7 +5145,6 @@ impl Session {
             estimated_total_tokens,
         )
         .await;
-        self.send_token_count_event(turn_context).await;
     }
 
     pub(crate) async fn update_rate_limits(

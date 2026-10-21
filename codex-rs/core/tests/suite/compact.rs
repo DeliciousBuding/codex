@@ -41,6 +41,7 @@ use core_test_support::context_snapshot::ContextSnapshotOptions;
 use core_test_support::hooks::trust_discovered_hooks;
 use core_test_support::responses;
 use core_test_support::responses::ev_reasoning_item;
+use core_test_support::responses::ev_web_search_call_done;
 use core_test_support::responses::mount_models_once;
 use core_test_support::responses::strip_response_item_ids_from_json;
 use core_test_support::skip_if_no_network;
@@ -176,6 +177,80 @@ fn ev_completed_with_usage(id: &str, input_tokens: i64, output_tokens: i64) -> V
 
 fn body_contains_text(body: &str, text: &str) -> bool {
     body.contains(&json_fragment(text))
+}
+
+#[test_case::test_case(AutoCompactTokenLimitScope::Total; "total")]
+#[test_case::test_case(AutoCompactTokenLimitScope::BodyAfterPrefix; "body_after_prefix")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hosted_web_search_usage_does_not_count_as_active_context(
+    scope: AutoCompactTokenLimitScope,
+) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    const MODEL_CONTEXT_WINDOW: i64 = 128_000;
+    const AUTO_COMPACT_LIMIT: i64 = 100_000;
+    const SEED_USAGE: i64 = 2_000;
+    const HOSTED_SEARCH_USAGE: i64 = 110_000;
+
+    let server = start_mock_server().await;
+    let request_log = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_assistant_message("seed", FIRST_REPLY),
+                ev_completed_with_tokens("seed", SEED_USAGE),
+            ]),
+            sse(vec![
+                ev_web_search_call_done("hosted-search", "completed", "codex web search"),
+                ev_assistant_message("search", SECOND_LARGE_REPLY),
+                ev_completed_with_tokens("search", HOSTED_SEARCH_USAGE),
+            ]),
+            sse(vec![
+                ev_assistant_message("follow-up", FINAL_REPLY),
+                ev_completed_with_tokens("follow-up", 5),
+            ]),
+        ],
+    )
+    .await;
+
+    let model_provider = non_openai_model_provider(&server);
+    let test = test_codex()
+        .with_config(move |config| {
+            config.model_provider = model_provider;
+            set_test_compact_prompt(config);
+            config.model_context_window = Some(MODEL_CONTEXT_WINDOW);
+            config.model_auto_compact_token_limit = Some(AUTO_COMPACT_LIMIT);
+            config.model_auto_compact_token_limit_scope = scope;
+        })
+        .build(&server)
+        .await?;
+
+    test.submit_turn("seed context").await?;
+    test.submit_turn("search the web").await?;
+
+    let usage = test
+        .codex
+        .token_usage_info()
+        .await
+        .expect("usage should be recorded");
+    assert_eq!(
+        usage.total_token_usage.total_tokens,
+        SEED_USAGE + HOSTED_SEARCH_USAGE,
+        "provider aggregate usage must remain available for billing"
+    );
+    assert!(
+        usage.last_token_usage.total_tokens < AUTO_COMPACT_LIMIT,
+        "retained transcript usage must replace hosted-search aggregate usage: {usage:?}"
+    );
+
+    test.submit_turn("continue after search").await?;
+    assert_eq!(
+        request_log.requests().len(),
+        3,
+        "hosted-search aggregate usage must not trigger auto-compaction under {scope:?}"
+    );
+
+    Ok(())
 }
 
 fn json_fragment(text: &str) -> String {

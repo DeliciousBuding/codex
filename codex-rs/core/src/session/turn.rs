@@ -2694,6 +2694,7 @@ async fn try_run_sampling_request(
     let mut should_emit_token_count = false;
     const MAX_ANALYTICS_TOOL_CALL_IDS_PER_RESPONSE: usize = 256;
     let mut analytics_tool_call_ids = Vec::new();
+    let mut saw_hosted_web_search = false;
     let reasoning_effort = step_context
         .settings
         .reasoning_effort()
@@ -2800,6 +2801,7 @@ async fn try_run_sampling_request(
             }
             ResponseEvent::OutputItemDone(mut item) => {
                 assign_missing_streamed_response_item_id(&mut item, active_item.as_ref());
+                saw_hosted_web_search |= matches!(&item, ResponseItem::WebSearchCall { .. });
                 sess.reserve_assistant_message_order(&turn_context, &item)
                     .await;
                 if analytics_tool_call_ids.len() < MAX_ANALYTICS_TOOL_CALL_IDS_PER_RESPONSE {
@@ -3096,18 +3098,30 @@ async fn try_run_sampling_request(
                     usage_metadata.as_ref(),
                 )
                 .await;
+                let usage_context = if saw_hosted_web_search {
+                    super::TokenUsageContext::SpendingOnly
+                } else {
+                    super::TokenUsageContext::Sampling
+                };
                 let budget_result = sess
                     .record_token_usage_info(
                         &turn_context,
                         &step_context.settings,
                         token_usage.as_ref(),
-                        super::TokenUsageContext::Sampling,
+                        usage_context,
                     )
                     .await;
                 should_emit_token_count = true;
                 should_emit_turn_diff = true;
                 if let Err(err) = budget_result {
                     break Err(err);
+                }
+                if saw_hosted_web_search {
+                    // Hosted search aggregates subrequest usage into response.completed.
+                    // Charge that usage to spending, but derive context occupancy from
+                    // the transcript that is actually retained.
+                    sess.recompute_token_usage_without_event(&turn_context)
+                        .await;
                 }
                 if let Some(false) = end_turn {
                     needs_follow_up = true;
